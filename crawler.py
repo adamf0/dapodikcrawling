@@ -303,6 +303,10 @@ async def chain_crawl_kecamatan(
             if not details:
                 logger.log(f"Scraping profile: {s_name} ({s_npsn})...")
                 details = await fetch_school_details(client, s_enkrip, semaphore, delay, logger)
+                if details.get("status_kepemilikan"):
+                    logger.log(f"Scraped successfully: {s_name} ({s_npsn})")
+                else:
+                    logger.log(f"Scraped profile failed (using default empty profile): {s_name} ({s_npsn})")
             else:
                 logger.log(f"Cache Hit (DB): Skipping profile scrape for {s_name} ({s_npsn})")
                 
