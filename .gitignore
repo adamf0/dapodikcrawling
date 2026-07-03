@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Database
+dapodik.db
+
+# Logs
+logs/
+*.log
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+.env
+
+# OS-specific
+.DS_Store
+Thumbs.db

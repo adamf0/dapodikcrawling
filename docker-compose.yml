@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  web:
+    build: .
+    container_name: dapodik_scraper
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist SQLite database and logs on host machine
+      - ./dapodik.db:/app/dapodik.db
+      - ./logs:/app/logs
+    restart: always

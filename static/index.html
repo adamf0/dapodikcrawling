@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dapodik Data Crawler & Browser Dashboard</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header>
+            <div class="logo-container">
+                <h1>Dapodik Scraper System</h1>
+                <p>Parallel requests tree crawler with persistent SQLite storage and polite throttling</p>
+            </div>
+            <div class="status-badge">
+                <div class="status-indicator" id="system-status-indicator"></div>
+                <span id="system-status-text">Checking status...</span>
+            </div>
+        </header>
+
+        <!-- Stats Cards -->
+        <div class="stats-strip">
+            <div class="stat-card">
+                <div class="stat-label">Provinces</div>
+                <div class="stat-value" id="stat-provinces">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Regencies (Kabupaten)</div>
+                <div class="stat-value" id="stat-kabupatens">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Districts (Kecamatan)</div>
+                <div class="stat-value" id="stat-kecamatans">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Schools Stored (SQLite)</div>
+                <div class="stat-value" id="stat-sekolahs">0</div>
+            </div>
+        </div>
+
+        <!-- Main Dashboard Grid -->
+        <div class="dashboard-grid">
+            <!-- Setup Control Panel -->
+            <div class="glass-panel">
+                <h2 class="panel-title"><i class="fa-solid fa-sliders"></i> Scraper Settings</h2>
+                
+                <!-- <div class="form-group">
+                    <label class="form-label">Target Province Codes (Optional)</label>
+                    <input type="text" id="target-prov-ids" class="form-input" placeholder="e.g. 050000, 040000">
+                    <small style="color: var(--text-muted); font-size: 0.8rem; display: block; margin-top: 0.25rem;">
+                        Comma separated. Leave blank to crawl all.
+                    </small>
+                </div> -->
+
+                <div class="form-group">
+                    <label class="form-label">Bentuk Pendidikan</label>
+                    <div class="checkbox-group">
+                        <label class="checkbox-btn">
+                            <input type="checkbox" class="bentuk-cb" value="sd" checked>
+                            <span>SD</span>
+                        </label>
+                        <label class="checkbox-btn">
+                            <input type="checkbox" class="bentuk-cb" value="smp" checked>
+                            <span>SMP</span>
+                        </label>
+                        <label class="checkbox-btn">
+                            <input type="checkbox" class="bentuk-cb" value="sma" checked>
+                            <span>SMA</span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Semester ID</label>
+                    <input type="text" id="semester-id" class="form-input" value="20252">
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Concurrency Limit</label>
+                    <input type="number" id="concurrency" class="form-input" value="3" min="1" max="15">
+                    <small style="color: var(--text-muted); font-size: 0.8rem; display: block; margin-top: 0.25rem;">
+                        Low limits (e.g. 3) reduce Nginx 503 errors.
+                    </small>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Polite Delay (Seconds per Request)</label>
+                    <input type="number" id="delay" class="form-input" value="0.5" min="0" max="10" step="0.1">
+                    <small style="color: var(--text-muted); font-size: 0.8rem; display: block; margin-top: 0.25rem;">
+                        Adds delay after each request to bypass rate limit.
+                    </small>
+                </div>
+
+                <div class="form-group" style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 2rem;">
+                    <input type="checkbox" id="force-recrawl" style="cursor: pointer; width: 16px; height: 16px;">
+                    <label for="force-recrawl" style="font-size: 0.9rem; cursor: pointer; user-select: none;">Force Recrawl (Bypass Caching)</label>
+                </div>
+
+                <button id="btn-start" class="btn btn-primary"><i class="fa-solid fa-play"></i> Start Crawler</button>
+                <button id="btn-cancel" class="btn btn-danger" style="display: none; margin-top: 0.75rem;"><i class="fa-solid fa-stop"></i> Cancel Crawler</button>
+            </div>
+
+            <!-- Terminal Logger -->
+            <div class="glass-panel console-panel">
+                <h2 class="panel-title"><i class="fa-solid fa-terminal"></i> Scraper Terminal Logs</h2>
+                
+                <div class="console-terminal" id="terminal">
+                    <div class="console-line system">[SYSTEM] Ready. Setup options and click 'Start Crawler'.</div>
+                </div>
+
+                <div class="progress-container" id="job-progress-wrapper" style="display: none;">
+                    <div class="progress-label-row">
+                        <span id="progress-step-text">Current Step: -</span>
+                        <span id="progress-percentage">0%</span>
+                    </div>
+                    <div class="progress-bg">
+                        <div class="progress-bar" id="progress-bar"></div>
+                    </div>
+                    <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem; text-align: right;" id="progress-detail-text">
+                        0/0 items processed
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Explorer Section -->
+        <div class="section-header">SQLite Data Browser</div>
+        
+        <div class="glass-panel" style="margin-bottom: 2rem;">
+            <!-- Filters -->
+            <div class="explorer-filters">
+                <div class="select-wrapper">
+                    <select id="filter-province">
+                        <option value="">-- Select Province --</option>
+                    </select>
+                </div>
+                
+                <div class="select-wrapper">
+                    <select id="filter-kabupaten" disabled>
+                        <option value="">-- Select Regency --</option>
+                    </select>
+                </div>
+
+                <div class="select-wrapper">
+                    <select id="filter-kecamatan" disabled>
+                        <option value="">-- Select District --</option>
+                    </select>
+                </div>
+
+                <input type="text" id="filter-search" class="form-input" placeholder="Search by school name or NPSN...">
+            </div>
+
+            <div class="explorer-filters" style="grid-template-columns: repeat(2, 1fr); max-width: 50%; margin-bottom: 1.5rem;">
+                <div class="select-wrapper">
+                    <select id="filter-bentuk">
+                        <option value="">-- Select Shape --</option>
+                        <option value="SD">SD</option>
+                        <option value="SMP">SMP</option>
+                        <option value="SMA">SMA</option>
+                    </select>
+                </div>
+                
+                <div class="select-wrapper">
+                    <select id="filter-status">
+                        <option value="">-- Select Status --</option>
+                        <option value="Negeri">Negeri</option>
+                        <option value="Swasta">Swasta</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Table -->
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>NPSN</th>
+                            <th>School Name</th>
+                            <th>Akreditasi</th>
+                            <th>Kepsek</th>
+                            <th>Operator</th>
+                            <th>Bentuk</th>
+                            <th>Status</th>
+                            <th>Desa / Kelurahan</th>
+                            <th>Kecamatan</th>
+                            <th>Kabupaten</th>
+                            <th>Provinsi</th>
+                            <th>Kode Pos</th>
+                            <th>Kurikulum</th>
+                            <th>PTK</th>
+                            <th>Students (PD)</th>
+                            <th>Rombel</th>
+                            <th>Sync Date</th>
+                        </tr>
+                    </thead>
+                    <tbody id="school-table-body">
+                        <tr>
+                            <td colspan="17" style="text-align: center; color: var(--text-muted); padding: 3rem;">
+                                Select filters or search to load schools data.
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Pagination & Export -->
+            <div class="pagination-row">
+                <div class="pagination-info" id="pagination-info">
+                    Showing 0 of 0 schools
+                </div>
+                <div style="display: flex; gap: 1rem; align-items: center;">
+                    <button class="btn btn-secondary" id="btn-export" style="width: auto; padding: 0.5rem 1rem; font-size: 0.9rem;">
+                        <i class="fa-solid fa-file-csv"></i> Export to CSV
+                    </button>
+                    <div class="pagination-btns">
+                        <button class="pagination-btn" id="pagination-prev" disabled><i class="fa-solid fa-chevron-left"></i> Prev</button>
+                        <button class="pagination-btn" id="pagination-next" disabled>Next <i class="fa-solid fa-chevron-right"></i></button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
