@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Text
+from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Text, Float, Boolean
 from sqlalchemy.orm import relationship
 from database import Base
 import datetime
@@ -100,6 +100,15 @@ class CrawlJob(Base):
     total_sekolahs = Column(Integer, default=0)
     processed_sekolahs = Column(Integer, default=0)
     
+    # Crawl configuration parameters for automatic resume
+    target_provinsi_ids = Column(Text, nullable=True)  # JSON-serialized list
+    bentuk_pendidikan_list = Column(Text, nullable=True)  # JSON-serialized list
+    semester_id = Column(String(20), default="20252")
+    concurrency_limit = Column(Integer, default=5)
+    delay = Column(Float, default=0.5)
+    force_recrawl = Column(Boolean, default=False)
+    
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
     error_message = Column(Text, nullable=True)
+

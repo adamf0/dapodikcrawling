@@ -353,6 +353,7 @@ async def chain_crawl_kabupaten(
         existing_kecs = db_local.query(Kecamatan).filter(Kecamatan.mst_kode_wilayah == k_code).all()
         
     kec_items = []
+    kec_url = f"https://dapo.kemendikdasmen.go.id/rekap/dataSekolah?id_level_wilayah=2&kode_wilayah={k_code}&semester_id={semester_id}"
     try:
         if existing_kecs:
             logger.log(f"Cache Hit (DB): Found {len(existing_kecs)} Kecamatans for Kabupaten {k_name} in DB.")
@@ -422,6 +423,7 @@ async def chain_crawl_province(
         existing_kabs = db_local.query(Kabupaten).filter(Kabupaten.mst_kode_wilayah == prov_code).all()
         
     kab_items = []
+    kab_url = f"https://dapo.kemendikdasmen.go.id/rekap/dataSekolah?id_level_wilayah=1&kode_wilayah={prov_code}&semester_id={semester_id}"
     try:
         if existing_kabs:
             logger.log(f"Cache Hit (DB): Found {len(existing_kabs)} Kabupatens for Province {prov_name} in DB.")

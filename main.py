@@ -3,6 +3,7 @@ import uuid
 import asyncio
 import csv
 import io
+import json
 from typing import Optional, List
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,17 +28,26 @@ app = FastAPI(
 )
 @app.on_event("startup")
 async def startup_event():
-    # Clean up any stale running/pending jobs in database
+    # Automatically resume any running/pending jobs in database on startup
     db = SessionLocal()
     try:
-        stale_jobs = db.query(CrawlJob).filter(CrawlJob.status.in_(["running", "pending"])).all()
-        for job in stale_jobs:
-            job.status = "failed"
-            job.error_message = "Job abandoned due to server restart."
-            print(f"Cleaned up stale job: {job.id}")
-        db.commit()
+        active_jobs = db.query(CrawlJob).filter(CrawlJob.status.in_(["running", "pending"])).all()
+        for job in active_jobs:
+            print(f"Resuming active job: {job.id} in background...")
+            prov_ids = json.loads(job.target_provinsi_ids) if job.target_provinsi_ids else None
+            bentuk_list = json.loads(job.bentuk_pendidikan_list) if job.bentuk_pendidikan_list else None
+            
+            start_background_crawl(
+                job_id=job.id,
+                target_provinsi_ids=prov_ids,
+                bentuk_pendidikan_list=bentuk_list,
+                semester_id=job.semester_id,
+                concurrency_limit=job.concurrency_limit,
+                delay=job.delay,
+                force_recrawl=job.force_recrawl
+            )
     except Exception as e:
-        print(f"Error during startup cleanup: {e}")
+        print(f"Error during startup resume: {e}")
     finally:
         db.close()
 
@@ -82,7 +92,13 @@ async def start_crawl(req: CrawlRequest, db: Session = Depends(get_db)):
     new_job = CrawlJob(
         id=job_id,
         status="pending",
-        current_step="idle"
+        current_step="idle",
+        target_provinsi_ids=json.dumps(req.target_provinsi_ids) if req.target_provinsi_ids else None,
+        bentuk_pendidikan_list=json.dumps(req.bentuk_pendidikan_list) if req.bentuk_pendidikan_list else None,
+        semester_id=req.semester_id,
+        concurrency_limit=req.concurrency_limit,
+        delay=req.delay,
+        force_recrawl=req.force_recrawl
     )
     db.add(new_job)
     db.commit()
@@ -90,7 +106,7 @@ async def start_crawl(req: CrawlRequest, db: Session = Depends(get_db)):
     # Trigger background crawler
     start_background_crawl(
         job_id=job_id,
-        # target_provinsi_ids=req.target_provinsi_ids,
+        target_provinsi_ids=req.target_provinsi_ids,
         bentuk_pendidikan_list=req.bentuk_pendidikan_list,
         semester_id=req.semester_id,
         concurrency_limit=req.concurrency_limit,
