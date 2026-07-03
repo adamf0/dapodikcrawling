@@ -25,6 +25,21 @@ app = FastAPI(
     description="FastAPI application to crawl, save, search and export national school records from Dapodik.",
     version="2.0.0"
 )
+@app.on_event("startup")
+async def startup_event():
+    # Clean up any stale running/pending jobs in database
+    db = SessionLocal()
+    try:
+        stale_jobs = db.query(CrawlJob).filter(CrawlJob.status.in_(["running", "pending"])).all()
+        for job in stale_jobs:
+            job.status = "failed"
+            job.error_message = "Job abandoned due to server restart."
+            print(f"Cleaned up stale job: {job.id}")
+        db.commit()
+    except Exception as e:
+        print(f"Error during startup cleanup: {e}")
+    finally:
+        db.close()
 
 # Enable CORS
 app.add_middleware(
