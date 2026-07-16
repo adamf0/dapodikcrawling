@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 
 # Database
-dapodik.db
+# dapodik.db
 
 # Logs
 logs/
