@@ -56,6 +56,19 @@
                 </div> -->
 
                 <div class="form-group">
+                    <label class="form-label">Tahap Crawling / Crawl Stage</label>
+                    <div class="select-wrapper">
+                        <select id="crawl-step" class="form-input" style="width: 100%; padding: 0.5rem; border-radius: 6px;">
+                            <option value="all">Full Pipeline (1. Prov -> 2. Kab -> 3. Kec -> 4. Sekolah)</option>
+                            <option value="provinces">Stage 1: Crawl Provinsi</option>
+                            <option value="kabupatens">Stage 2: Crawl Kabupaten</option>
+                            <option value="kecamatans">Stage 3: Crawl Kecamatan</option>
+                            <option value="sekolahs">Stage 4: Crawl Sekolah</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="form-group">
                     <label class="form-label">Bentuk Pendidikan</label>
                     <div class="checkbox-group">
                         <label class="checkbox-btn">
@@ -101,6 +114,7 @@
 
                 <button id="btn-start" class="btn btn-primary"><i class="fa-solid fa-play"></i> Start Crawler</button>
                 <button id="btn-cancel" class="btn btn-danger" style="display: none; margin-top: 0.75rem;"><i class="fa-solid fa-stop"></i> Cancel Crawler</button>
+                <button id="btn-truncate" class="btn btn-secondary" style="margin-top: 0.75rem; background: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.4);"><i class="fa-solid fa-trash-can"></i> Truncate Database</button>
             </div>
 
             <!-- Terminal Logger -->

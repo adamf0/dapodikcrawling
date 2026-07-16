@@ -14,12 +14,14 @@ const statKecamatans = document.getElementById('stat-kecamatans');
 const statSekolahs = document.getElementById('stat-sekolahs');
 
 // const inputTargetProvs = document.getElementById('target-prov-ids');
+const inputCrawlStep = document.getElementById('crawl-step');
 const inputSemesterId = document.getElementById('semester-id');
 const inputConcurrency = document.getElementById('concurrency');
 const inputDelay = document.getElementById('delay');
 const inputForceRecrawl = document.getElementById('force-recrawl');
 const btnStart = document.getElementById('btn-start');
 const btnCancel = document.getElementById('btn-cancel');
+const btnTruncate = document.getElementById('btn-truncate');
 
 const terminal = document.getElementById('terminal');
 const progressWrapper = document.getElementById('job-progress-wrapper');
@@ -52,6 +54,7 @@ document.addEventListener('DOMContentLoaded', () => {
 function setupEventListeners() {
     btnStart.addEventListener('click', startCrawl);
     btnCancel.addEventListener('click', cancelCrawl);
+    if (btnTruncate) btnTruncate.addEventListener('click', truncateDatabase);
     btnExport.addEventListener('click', exportToCSV);
     
     filterProvince.addEventListener('change', handleProvinceChange);
@@ -141,11 +144,10 @@ async function startCrawl() {
         return;
     }
 
-    // const targetProvsRaw = inputTargetProvs.value.trim();
-    // const targetProvinsiIds = targetProvsRaw ? targetProvsRaw.split(',').map(s => s.trim()) : null;
+    const stepValue = inputCrawlStep ? inputCrawlStep.value : 'all';
     
     const payload = {
-        // target_provinsi_ids: targetProvinsiIds,
+        step: stepValue,
         bentuk_pendidikan_list: checkedBentuk,
         semester_id: inputSemesterId.value.trim(),
         concurrency_limit: parseInt(inputConcurrency.value) || 3,
@@ -153,7 +155,7 @@ async function startCrawl() {
         force_recrawl: inputForceRecrawl.checked
     };
 
-    appendConsoleLine('Initiating crawl request...', 'system');
+    appendConsoleLine(`Initiating crawl request for stage: ${stepValue}...`, 'system');
     btnStart.disabled = true;
 
     try {
@@ -169,11 +171,32 @@ async function startCrawl() {
         }
 
         const res = await response.json();
-        appendConsoleLine(`Crawl job started. Job ID: ${res.job_id}`, 'system');
+        appendConsoleLine(`Crawl job started for stage '${stepValue}'. Job ID: ${res.job_id}`, 'system');
         connectToJob(res.job_id);
     } catch (err) {
         appendConsoleLine(`Error starting job: ${err.message}`, 'error');
         btnStart.disabled = false;
+    }
+}
+
+async function truncateDatabase() {
+    if (!confirm('Are you sure you want to TRUNCATE all data in the database? This cannot be undone!')) {
+        return;
+    }
+    try {
+        const response = await fetch('/api/db/truncate', { method: 'POST' });
+        if (!response.ok) {
+            const err = await response.json();
+            throw new Error(err.detail || 'Failed to truncate database.');
+        }
+        appendConsoleLine('Database successfully truncated!', 'system');
+        fetchStats();
+        loadProvinces();
+        fetchSchools();
+        alert('All database tables truncated successfully!');
+    } catch (err) {
+        alert('Truncate failed: ' + err.message);
+        appendConsoleLine('Truncate error: ' + err.message, 'error');
     }
 }
 

@@ -89,6 +89,7 @@ class CrawlJob(Base):
     
     id = Column(String(100), primary_key=True, index=True)
     status = Column(String(50), default="pending")  # pending, running, completed, failed, cancelled
+    step = Column(String(50), default="all")  # all, provinces, kabupatens, kecamatans, sekolahs
     current_step = Column(String(100), default="idle")
     
     total_provinces = Column(Integer, default=0)

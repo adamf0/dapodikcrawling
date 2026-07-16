@@ -2,7 +2,7 @@ import asyncio
 import os
 import datetime
 import re
-import httpx
+from curl_cffi.requests import AsyncSession
 from sqlalchemy.orm import Session
 from database import SessionLocal
 from models import Province, Kabupaten, Kecamatan, Sekolah, CrawlJob, CrawledKecamatan
@@ -58,35 +58,53 @@ async def update_job_db(job_id: str, field_updates: dict):
             db.close()
 
 
+async def get_api_token(session: AsyncSession, logger: JobLogger) -> str:
+    fallback = "6d04941d7990b3b5270fe4a2d48dbe2a2eea962ebc7dce8d5b18d9a5017fec43d1c1be738f7479a6e14f8a64d81751fe906c95c416565db6747715be9aaf218846357cc5524d9bfae710652f165b248cc968a62f49d6ac738bf7ea3ac3c74cc9e4dfa7d14bc9bdea26b5f217971af447b4c1346a5611bce1a06a76a099e59b3f"
+    try:
+        r = await session.get("https://dapo.kemendikdasmen.go.id/env.js", timeout=15)
+        if r.status_code == 200:
+            m = re.search(r'VITE_API_TOKEN:\s*"(.*?)"', r.text)
+            if m:
+                token = m.group(1).strip()
+                logger.log(f"Dynamic API Token fetched successfully: {token[:10]}...")
+                return token
+    except Exception as e:
+        logger.log(f"Warning: Failed to fetch dynamic API token: {e}. Using fallback token.")
+    return fallback
+
+
 async def fetch_json_with_retry(
-    client: httpx.AsyncClient,
+    session: AsyncSession,
     url: str,
     semaphore: asyncio.Semaphore,
     logger: JobLogger,
     delay: float = 0.5,
     max_retries: int = 10,
     backoff_factor: float = 2.0
-) -> list:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
-        "Referer": "https://dapo.kemendikdasmen.go.id/",
-    }
-    
+) -> dict:
     async with semaphore:
         for attempt in range(1, max_retries + 1):
             try:
-                response = await client.get(url, headers=headers, timeout=30.0)
+                response = await session.get(url, timeout=30.0)
                 if response.status_code == 200:
-                    # Polite delay after successful fetch
                     if delay > 0:
                         await asyncio.sleep(delay)
                     return response.json()
                 elif response.status_code == 503:
                     sleep_time = max(8.0, backoff_factor ** attempt * 4.0)
-                    logger.log(f"[RATE-LIMIT] Nginx 503 Rate Limited on {url}. Backing off for {sleep_time}s... (Attempt {attempt}/{max_retries})")
+                    logger.log(f"[RATE-LIMIT] 503 on {url}. Backing off {sleep_time}s... (Attempt {attempt}/{max_retries})")
                     await asyncio.sleep(sleep_time)
+                elif response.status_code in [401, 403]:
+                    ct = response.headers.get("content-type", "")
+                    if "application/json" in ct:
+                        logger.log(f"[TOKEN EXPIRED] Received {response.status_code} on {url}. Attempting token refresh...")
+                        new_token = await get_api_token(session, logger)
+                        session.headers["Authorization"] = f"Bearer {new_token}"
+                        continue
+                    else:
+                        sleep_time = max(10.0, backoff_factor ** attempt * 5.0)
+                        logger.log(f"[WAF BLOCK] Safeline WAF 403 on {url}. Backing off {sleep_time}s... (Attempt {attempt}/{max_retries})")
+                        await asyncio.sleep(sleep_time)
                 else:
                     logger.log(f"HTTP Error {response.status_code} for URL: {url} (Attempt {attempt}/{max_retries})")
             except Exception as e:
@@ -99,59 +117,236 @@ async def fetch_json_with_retry(
         raise Exception(f"Failed to fetch JSON from {url} after {max_retries} attempts.")
 
 
-async def fetch_html_with_retry(
-    client: httpx.AsyncClient,
-    url: str,
+# ----------------------------------------------------
+# MODULAR STAGE WORKERS
+# ----------------------------------------------------
+
+async def crawl_provinces_step(
+    session: AsyncSession,
+    target_provinsi_ids: list,
+    semester_id: str,
     semaphore: asyncio.Semaphore,
-    logger: JobLogger,
-    delay: float = 0.5,
-    max_retries: int = 10,
-    backoff_factor: float = 2.0
-) -> str:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
-        "Referer": "https://dapo.kemendikdasmen.go.id/",
-    }
-    
-    async with semaphore:
-        for attempt in range(1, max_retries + 1):
+    delay: float,
+    force_recrawl: bool,
+    job_id: str,
+    logger: JobLogger
+) -> list:
+    """Stage 1: Crawl Provinces"""
+    if job_id in CANCELLED_JOBS:
+        return []
+
+    await update_job_db(job_id, {"current_step": "provinces"})
+    logger.log("=== STAGE 1: Crawling Provinces ===")
+
+    db_local = SessionLocal()
+    existing_provs = []
+    try:
+        if not force_recrawl:
+            existing_provs = db_local.query(Province).all()
+    finally:
+        db_local.close()
+
+    provinces_to_process = []
+    if existing_provs:
+        logger.log(f"Cache Hit (DB): Found {len(existing_provs)} Provinces in DB.")
+        for prov in existing_provs:
+            if target_provinsi_ids and prov.kode_wilayah not in target_provinsi_ids:
+                continue
+            provinces_to_process.append((prov.kode_wilayah, prov.nama))
+    else:
+        logger.log("Fetching Provinces from Dapodik API...")
+        prov_url = "https://dapo.kemendikdasmen.go.id/api/progress-pengiriman/provinsi"
+        prov_payload = await fetch_json_with_retry(session, prov_url, semaphore, logger, delay)
+        prov_data = prov_payload.get("data", [])
+
+        db_local = SessionLocal()
+        try:
+            for item in prov_data:
+                code = safe_str(item.get("kode_provinsi"))
+                name = safe_str(item.get("provinsi"))
+                mst_code = "000000"
+
+                db_local.merge(Province(kode_wilayah=code, nama=name, mst_kode_wilayah=mst_code))
+                if target_provinsi_ids and code not in target_provinsi_ids:
+                    continue
+                provinces_to_process.append((code, name))
+            db_local.commit()
+        finally:
+            db_local.close()
+
+    total = len(provinces_to_process)
+    await update_job_db(job_id, {
+        "total_provinces": total,
+        "processed_provinces": total
+    })
+    logger.log(f"Stage 1 Complete: {total} Provinces saved/verified in database.")
+    return provinces_to_process
+
+
+async def crawl_kabupatens_step(
+    session: AsyncSession,
+    target_provinsi_ids: list,
+    semester_id: str,
+    semaphore: asyncio.Semaphore,
+    delay: float,
+    force_recrawl: bool,
+    job_id: str,
+    logger: JobLogger
+) -> list:
+    """Stage 2: Crawl Kabupatens for available Provinces"""
+    if job_id in CANCELLED_JOBS:
+        return []
+
+    await update_job_db(job_id, {"current_step": "kabupatens"})
+    logger.log("=== STAGE 2: Crawling Kabupatens ===")
+
+    db_local = SessionLocal()
+    provinces = []
+    try:
+        query = db_local.query(Province)
+        if target_provinsi_ids:
+            query = query.filter(Province.kode_wilayah.in_(target_provinsi_ids))
+        provinces = query.all()
+    finally:
+        db_local.close()
+
+    if not provinces:
+        logger.log("Warning: No Provinces found in DB to crawl Kabupatens. Run Stage 1 (Crawling Provinsi) first!")
+        return []
+
+    await update_job_db(job_id, {"total_provinces": len(provinces)})
+    all_kabupatens = []
+
+    for prov in provinces:
+        if job_id in CANCELLED_JOBS:
+            break
+
+        db_local = SessionLocal()
+        existing_kabs = []
+        try:
+            if not force_recrawl:
+                existing_kabs = db_local.query(Kabupaten).filter(Kabupaten.mst_kode_wilayah == prov.kode_wilayah).all()
+        finally:
+            db_local.close()
+
+        if existing_kabs:
+            logger.log(f"Cache Hit (DB): Found {len(existing_kabs)} Kabupatens for Province {prov.nama} in DB.")
+            for kab in existing_kabs:
+                all_kabupatens.append((kab.kode_wilayah, kab.nama))
+        else:
+            logger.log(f"Crawl: Fetching Kabupatens for Province: {prov.nama} ({prov.kode_wilayah})...")
+            kab_url = f"https://dapo.kemendikdasmen.go.id/api/progress-pengiriman/kabupaten?kode_provinsi={prov.kode_wilayah}"
+            kab_payload = await fetch_json_with_retry(session, kab_url, semaphore, logger, delay)
+            kab_data = kab_payload.get("data", [])
+
+            db_local = SessionLocal()
             try:
-                response = await client.get(url, headers=headers, timeout=20.0)
-                if response.status_code == 200:
-                    # Polite delay after successful fetch
-                    if delay > 0:
-                        await asyncio.sleep(delay)
-                    return response.text
-                elif response.status_code == 503:
-                    sleep_time = max(8.0, backoff_factor ** attempt * 4.0)
-                    logger.log(f"[RATE-LIMIT] Nginx 503 Rate Limited on {url}. Backing off for {sleep_time}s... (Attempt {attempt}/{max_retries})")
-                    await asyncio.sleep(sleep_time)
-                else:
-                    logger.log(f"HTTP Error {response.status_code} for URL: {url} (Attempt {attempt}/{max_retries})")
-            except Exception as e:
-                logger.log(f"Request Exception: {str(e)} for URL: {url} (Attempt {attempt}/{max_retries})")
-            
-            if attempt < max_retries:
-                sleep_time = backoff_factor ** attempt
-                await asyncio.sleep(sleep_time)
-                
-        raise Exception(f"Failed to fetch HTML from {url} after {max_retries} attempts.")
+                for item in kab_data:
+                    k_code = safe_str(item.get("kode_kabupaten"))
+                    k_name = safe_str(item.get("kabupaten"))
+                    k_mst = safe_str(item.get("kode_provinsi"))
+                    db_local.merge(Kabupaten(kode_wilayah=k_code, nama=k_name, mst_kode_wilayah=k_mst))
+                    all_kabupatens.append((k_code, k_name))
+                db_local.commit()
+            finally:
+                db_local.close()
+
+        await update_job_db(job_id, {
+            "increment_processed_provinces": 1,
+            "total_kabupatens": len(all_kabupatens)
+        })
+
+    logger.log(f"Stage 2 Complete: {len(all_kabupatens)} Kabupatens saved/verified in database.")
+    return all_kabupatens
 
 
-# ----------------------------------------------------
-# SCRAPING WORKER & PARSER
-# ----------------------------------------------------
+async def crawl_kecamatans_step(
+    session: AsyncSession,
+    target_provinsi_ids: list,
+    semester_id: str,
+    semaphore: asyncio.Semaphore,
+    delay: float,
+    force_recrawl: bool,
+    job_id: str,
+    logger: JobLogger
+) -> list:
+    """Stage 3: Crawl Kecamatans for available Kabupatens"""
+    if job_id in CANCELLED_JOBS:
+        return []
+
+    await update_job_db(job_id, {"current_step": "kecamatans"})
+    logger.log("=== STAGE 3: Crawling Kecamatans ===")
+
+    db_local = SessionLocal()
+    kabupatens = []
+    try:
+        query = db_local.query(Kabupaten)
+        if target_provinsi_ids:
+            query = query.filter(Kabupaten.mst_kode_wilayah.in_(target_provinsi_ids))
+        kabupatens = query.all()
+    finally:
+        db_local.close()
+
+    if not kabupatens:
+        logger.log("Warning: No Kabupatens found in DB to crawl Kecamatans. Run Stage 2 (Crawling Kabupaten) first!")
+        return []
+
+    await update_job_db(job_id, {"total_kabupatens": len(kabupatens)})
+    all_kecamatans = []
+
+    for kab in kabupatens:
+        if job_id in CANCELLED_JOBS:
+            break
+
+        db_local = SessionLocal()
+        existing_kecs = []
+        try:
+            if not force_recrawl:
+                existing_kecs = db_local.query(Kecamatan).filter(Kecamatan.mst_kode_wilayah == kab.kode_wilayah).all()
+        finally:
+            db_local.close()
+
+        if existing_kecs:
+            logger.log(f"Cache Hit (DB): Found {len(existing_kecs)} Kecamatans for Kabupaten {kab.nama} in DB.")
+            for kec in existing_kecs:
+                all_kecamatans.append((kec.kode_wilayah, kec.nama))
+        else:
+            logger.log(f"Crawl: Fetching Kecamatans for Kabupaten: {kab.nama} ({kab.kode_wilayah})...")
+            kec_url = f"https://dapo.kemendikdasmen.go.id/api/progress-pengiriman/kecamatan?kode_kabupaten={kab.kode_wilayah}"
+            kec_payload = await fetch_json_with_retry(session, kec_url, semaphore, logger, delay)
+            kec_data = kec_payload.get("data", [])
+
+            db_local = SessionLocal()
+            try:
+                for item in kec_data:
+                    kc_code = safe_str(item.get("kode_kecamatan"))
+                    kc_name = safe_str(item.get("kecamatan"))
+                    kc_mst = safe_str(item.get("kode_kabupaten"))
+                    db_local.merge(Kecamatan(kode_wilayah=kc_code, nama=kc_name, mst_kode_wilayah=kc_mst))
+                    all_kecamatans.append((kc_code, kc_name))
+                db_local.commit()
+            finally:
+                db_local.close()
+
+        await update_job_db(job_id, {
+            "increment_processed_kabupatens": 1,
+            "total_kecamatans": len(all_kecamatans)
+        })
+
+    logger.log(f"Stage 3 Complete: {len(all_kecamatans)} Kecamatans saved/verified in database.")
+    return all_kecamatans
+
 
 async def fetch_school_details(
-    client: httpx.AsyncClient,
-    school_id_enkrip: str,
+    session: AsyncSession,
+    npsn: str,
+    semester_id: str,
     semaphore: asyncio.Semaphore,
     delay: float,
     logger: JobLogger
 ) -> dict:
     details = {
+        "sekolah_id": None,
         "status_kepemilikan": None,
         "sk_pendirian_sekolah": None,
         "tanggal_sk_pendirian": None,
@@ -166,55 +361,55 @@ async def fetch_school_details(
         "operator": None,
         "akreditasi": None,
         "kurikulum": None,
-        "waktu": None
+        "waktu": None,
+        "jml_lab": 0,
+        "sinkron_terakhir": None
     }
-    
-    if not school_id_enkrip:
+    if not npsn:
         return details
-        
-    url = f"https://dapo.kemendikdasmen.go.id/sekolah/{school_id_enkrip}"
+
+    url = f"https://dapo.kemendikdasmen.go.id/api/detail-sekolah?npsn={npsn}"
     try:
-        html = await fetch_html_with_retry(client, url, semaphore, logger, delay)
-        
-        # Parse Identitas
-        identitas = re.findall(r'<p>\s*<strong>\s*(.*?)\s*:\s*</strong>\s*(.*?)\s*</p>', html)
-        identitas_dict = {key.strip(): val.strip() for key, val in identitas}
-        
-        details["status_kepemilikan"] = identitas_dict.get("Status Kepemilikan")
-        details["sk_pendirian_sekolah"] = identitas_dict.get("SK Pendirian Sekolah")
-        details["tanggal_sk_pendirian"] = identitas_dict.get("Tanggal SK Pendirian")
-        details["sk_izin_operasional"] = identitas_dict.get("SK Izin Operasional")
-        details["tanggal_sk_izin_operasional"] = identitas_dict.get("Tanggal SK Izin Operasional")
-        details["desa_kelurahan"] = identitas_dict.get("Desa / Kelurahan")
-        details["kecamatan_scraped"] = identitas_dict.get("Kecamatan")
-        details["kabupaten_scraped"] = identitas_dict.get("Kabupaten")
-        details["provinsi_scraped"] = identitas_dict.get("Provinsi")
-        details["kode_pos"] = identitas_dict.get("Kode Pos")
-        
-        # Parse Usermenu
-        usermenu = re.findall(r'([A-Za-z]+)\s*:\s*<strong>\s*(.*?)\s*</strong>', html)
-        usermenu_dict = {key.strip(): val.strip() for key, val in usermenu}
-        
-        details["kepsek"] = usermenu_dict.get("Kepsek")
-        details["operator"] = usermenu_dict.get("Operator")
-        details["akreditasi"] = usermenu_dict.get("Akreditasi")
-        details["kurikulum"] = usermenu_dict.get("Kurikulum")
-        details["waktu"] = usermenu_dict.get("Waktu")
-    except Exception:
-        pass
-        
+        payload = await fetch_json_with_retry(session, url, semaphore, logger, delay)
+        records = payload.get("data", [])
+        if not records:
+            return details
+
+        # Find the record matching semester_id, otherwise default to records[0] (latest)
+        selected_record = records[0]
+        for r in records:
+            if str(r.get("semester")) == str(semester_id):
+                selected_record = r
+                break
+
+        details["sekolah_id"] = selected_record.get("sekolah_id")
+        details["status_kepemilikan"] = selected_record.get("status_kepemilikan")
+        details["sk_pendirian_sekolah"] = selected_record.get("sk_pendirian_sekolah")
+        details["tanggal_sk_pendirian"] = selected_record.get("tlg_sk_pendirian_sekolah")
+        details["sk_izin_operasional"] = selected_record.get("sk_izin_operasional")
+        details["tanggal_sk_izin_operasional"] = selected_record.get("tlg_sk_izin_operasional")
+        details["desa_kelurahan"] = selected_record.get("desa_kelurahan")
+        details["kecamatan_scraped"] = selected_record.get("kecamatan")
+        details["kabupaten_scraped"] = selected_record.get("kabupaten")
+        details["provinsi_scraped"] = selected_record.get("provinsi")
+        details["kode_pos"] = selected_record.get("kode_pos")
+        details["kepsek"] = selected_record.get("nama_kepsek")
+        details["akreditasi"] = selected_record.get("akreditasi")
+        details["sinkron_terakhir"] = selected_record.get("tanggal_update")
+
+        # Lab calculations
+        lab_fields = ["lab_ipa", "lab_biologi", "lab_fisika", "lab_kimia", "lab_multi", "lab_kom", "lab_bahasa"]
+        details["jml_lab"] = sum(int(selected_record.get(f, 0) or 0) for f in lab_fields if selected_record.get(f) is not None)
+    except Exception as e:
+        logger.log(f"Error fetching profile details for NPSN {npsn}: {e}")
     return details
 
 
-# ----------------------------------------------------
-# CHAINED REQUEST WORKERS
-# ----------------------------------------------------
-
 async def chain_crawl_kecamatan(
-    client: httpx.AsyncClient,
+    session: AsyncSession,
     kc_code: str,
     kc_name: str,
-    bentuk: str,
+    bentuk_pendidikan_list: list,
     semester_id: str,
     semaphore: asyncio.Semaphore,
     delay: float,
@@ -224,65 +419,71 @@ async def chain_crawl_kecamatan(
 ):
     if job_id in CANCELLED_JOBS:
         return
-    
+
     # Check cache unless force_recrawl
+    uncrawled_bentuk_list = []
     if not force_recrawl:
         db = SessionLocal()
         try:
-            crawled = db.query(CrawledKecamatan).filter(
-                CrawledKecamatan.kecamatan_id == kc_code,
-                CrawledKecamatan.bentuk_pendidikan == bentuk
-            ).first()
+            for bentuk in bentuk_pendidikan_list:
+                crawled = db.query(CrawledKecamatan).filter(
+                    CrawledKecamatan.kecamatan_id == kc_code,
+                    CrawledKecamatan.bentuk_pendidikan == bentuk
+                ).first()
+                if not crawled:
+                    uncrawled_bentuk_list.append(bentuk)
         finally:
             db.close()
-        if crawled:
-            logger.log(f"Cache Hit: Skipping {bentuk.upper()} schools for Kecamatan: {kc_name}")
-            await update_job_db(job_id, {"increment_processed_sekolahs": 1})
-            return
+    else:
+        uncrawled_bentuk_list = bentuk_pendidikan_list.copy()
 
-    logger.log(f"Crawl: Fetching {bentuk.upper()} schools for Kecamatan: {kc_name} ({kc_code})...")
-    school_url = f"https://dapo.kemendikdasmen.go.id/rekap/progresSP?id_level_wilayah=3&kode_wilayah={kc_code}&semester_id={semester_id}&bentuk_pendidikan_id={bentuk}"
+    if not uncrawled_bentuk_list:
+        logger.log(f"Cache Hit: Skipping schools for Kecamatan: {kc_name}")
+        await update_job_db(job_id, {"increment_processed_sekolahs": len(bentuk_pendidikan_list)})
+        return
+
+    # Uppercase target jenjang
+    jenjang_param = ",".join([b.upper() for b in uncrawled_bentuk_list])
+    logger.log(f"Crawl: Fetching schools for Kecamatan: {kc_name} ({kc_code}) for shapes: {jenjang_param}...")
+    
+    school_url = f"https://dapo.kemendikdasmen.go.id/api/progress-pengiriman/kecamatan/school?kode_kecamatan={kc_code}&jenjang={jenjang_param}"
     
     try:
-        school_data = await fetch_json_with_retry(client, school_url, semaphore, logger, delay)
+        school_payload = await fetch_json_with_retry(session, school_url, semaphore, logger, delay)
+        school_data = school_payload.get("data", [])
         if not school_data:
             school_data = []
-            
+
         db_local = SessionLocal()
         cache_hits = {}
         try:
-            school_ids = [safe_str(item.get("sekolah_id")) for item in school_data if item.get("sekolah_id")]
-            if school_ids and not force_recrawl:
-                existing_schools = db_local.query(Sekolah).filter(Sekolah.sekolah_id.in_(school_ids)).all()
+            npsns = [safe_str(item.get("npsn")) for item in school_data if item.get("npsn")]
+            if npsns and not force_recrawl:
+                existing_schools = db_local.query(Sekolah).filter(Sekolah.npsn.in_(npsns)).all()
                 for s in existing_schools:
                     if s.status_kepemilikan is not None:
-                        cache_hits[s.sekolah_id] = s
+                        cache_hits[s.npsn] = s
         finally:
             db_local.close()
-            
+
         resolved_schools = []
         async def process_single_school(item):
-            s_id = safe_str(item.get("sekolah_id"))
-            s_enkrip = safe_str(item.get("sekolah_id_enkrip"))
-            s_name = safe_str(item.get("nama"))
             s_npsn = safe_str(item.get("npsn"))
+            s_name = safe_str(item.get("nama"))
             s_bentuk = safe_str(item.get("bentuk_pendidikan"))
             s_status = safe_str(item.get("status_sekolah"))
             
-            ptk = int(item.get("ptk") or 0)
-            peg = int(item.get("pegawai") or 0)
             pd = int(item.get("pd") or 0)
             rombel = int(item.get("rombel") or 0)
-            rk = int(item.get("jml_rk") or 0)
-            lab = int(item.get("jml_lab") or 0)
-            perpus = int(item.get("jml_perpus") or 0)
-            sinkron = safe_str(item.get("sinkron_terakhir"))
+            rk = int(item.get("ruang_kelas") or 0)
+            perpus = int(item.get("perpus") or 0)
             
             # Check cache map
             details = None
-            if s_id in cache_hits:
-                existing = cache_hits[s_id]
+            if s_npsn in cache_hits:
+                existing = cache_hits[s_npsn]
                 details = {
+                    "sekolah_id": existing.sekolah_id,
                     "status_kepemilikan": existing.status_kepemilikan,
                     "sk_pendirian_sekolah": existing.sk_pendirian_sekolah,
                     "tanggal_sk_pendirian": existing.tanggal_sk_pendirian,
@@ -294,37 +495,42 @@ async def chain_crawl_kecamatan(
                     "provinsi_scraped": existing.provinsi_scraped,
                     "kode_pos": existing.kode_pos,
                     "kepsek": existing.kepsek,
-                    "operator": existing.operator,
                     "akreditasi": existing.akreditasi,
-                    "kurikulum": existing.kurikulum,
-                    "waktu": existing.waktu
+                    "sinkron_terakhir": existing.sinkron_terakhir,
+                    "jml_lab": existing.jml_lab
                 }
                 
-            if not details:
-                logger.log(f"Scraping profile: {s_name} ({s_npsn})...")
-                details = await fetch_school_details(client, s_enkrip, semaphore, delay, logger)
-                if details.get("status_kepemilikan"):
-                    logger.log(f"Scraped successfully: {s_name} ({s_npsn})")
+            if not details or not details.get("sekolah_id"):
+                logger.log(f"Fetching profile via API: {s_name} ({s_npsn})...")
+                details = await fetch_school_details(session, s_npsn, semester_id, semaphore, delay, logger)
+                if details.get("sekolah_id"):
+                    logger.log(f"Fetched successfully: {s_name} ({s_npsn})")
                 else:
-                    logger.log(f"Scraped profile failed (using default empty profile): {s_name} ({s_npsn})")
+                    logger.log(f"Fetched profile failed (using default empty profile): {s_name} ({s_npsn})")
             else:
-                logger.log(f"Cache Hit (DB): Skipping profile scrape for {s_name} ({s_npsn})")
+                logger.log(f"Cache Hit (DB): Skipping profile API fetch for {s_name} ({s_npsn})")
                 
+            sekolah_id = details.get("sekolah_id") or f"npsn-{s_npsn}"
+            
+            jum_guru = int(item.get("jum_guru") or 0)
+            jum_tendik = int(item.get("jum_tendik") or 0)
+            ptk = jum_guru + jum_tendik
+            
             resolved_schools.append(Sekolah(
-                sekolah_id=s_id,
-                sekolah_id_enkrip=s_enkrip,
+                sekolah_id=sekolah_id,
+                sekolah_id_enkrip=None,
                 nama=s_name,
                 npsn=s_npsn,
                 bentuk_pendidikan=s_bentuk,
                 status_sekolah=s_status,
                 ptk=ptk,
-                pegawai=peg,
+                pegawai=jum_tendik,
                 pd=pd,
                 rombel=rombel,
                 jml_rk=rk,
-                jml_lab=lab,
+                jml_lab=details.get("jml_lab", 0),
                 jml_perpus=perpus,
-                sinkron_terakhir=sinkron,
+                sinkron_terakhir=details.get("sinkron_terakhir") or safe_str(item.get("tanggal_update")),
                 status_kepemilikan=details["status_kepemilikan"],
                 sk_pendirian_sekolah=details["sk_pendirian_sekolah"],
                 tanggal_sk_pendirian=details["tanggal_sk_pendirian"],
@@ -336,10 +542,10 @@ async def chain_crawl_kecamatan(
                 provinsi_scraped=details["provinsi_scraped"],
                 kode_pos=details["kode_pos"],
                 kepsek=details["kepsek"],
-                operator=details["operator"],
+                operator=None,
                 akreditasi=details["akreditasi"],
-                kurikulum=details["kurikulum"],
-                waktu=details["waktu"],
+                kurikulum=None,
+                waktu=None,
                 kecamatan_id=kc_code
             ))
             
@@ -349,20 +555,20 @@ async def chain_crawl_kecamatan(
         try:
             for s in resolved_schools:
                 db_local.merge(s)
-            db_local.merge(CrawledKecamatan(kecamatan_id=kc_code, bentuk_pendidikan=bentuk))
+            for bentuk in uncrawled_bentuk_list:
+                db_local.merge(CrawledKecamatan(kecamatan_id=kc_code, bentuk_pendidikan=bentuk))
             db_local.commit()
         finally:
             db_local.close()
     except Exception as e:
-        logger.log(f"Error fetching {bentuk} schools for {kc_name}: {e}")
+        logger.log(f"Error fetching schools for {kc_name}: {e}")
         
-    await update_job_db(job_id, {"increment_processed_sekolahs": 1})
+    await update_job_db(job_id, {"increment_processed_sekolahs": len(bentuk_pendidikan_list)})
 
 
-async def chain_crawl_kabupaten(
-    client: httpx.AsyncClient,
-    k_code: str,
-    k_name: str,
+async def crawl_sekolahs_step(
+    session: AsyncSession,
+    target_provinsi_ids: list,
     bentuk_pendidikan_list: list,
     semester_id: str,
     semaphore: asyncio.Semaphore,
@@ -371,133 +577,48 @@ async def chain_crawl_kabupaten(
     job_id: str,
     logger: JobLogger
 ):
+    """Stage 4: Crawl Sekolahs for available Kecamatans"""
     if job_id in CANCELLED_JOBS:
         return
-        
+
+    await update_job_db(job_id, {"current_step": "sekolahs"})
+    logger.log("=== STAGE 4: Crawling Sekolahs ===")
+
     db_local = SessionLocal()
-    existing_kecs = []
+    kecamatans = []
     try:
-        if not force_recrawl:
-            existing_kecs = db_local.query(Kecamatan).filter(Kecamatan.mst_kode_wilayah == k_code).all()
+        if target_provinsi_ids:
+            kecamatans = db_local.query(Kecamatan).join(Kabupaten).filter(Kabupaten.mst_kode_wilayah.in_(target_provinsi_ids)).all()
+        else:
+            kecamatans = db_local.query(Kecamatan).all()
     finally:
         db_local.close()
-        
-    kec_items = []
-    kec_url = f"https://dapo.kemendikdasmen.go.id/rekap/dataSekolah?id_level_wilayah=2&kode_wilayah={k_code}&semester_id={semester_id}"
-    try:
-        if existing_kecs:
-            logger.log(f"Cache Hit (DB): Found {len(existing_kecs)} Kecamatans for Kabupaten {k_name} in DB.")
-            for kec in existing_kecs:
-                kec_items.append((kec.kode_wilayah, kec.nama))
-            kec_data = [] # Mock for increment processed count later
-        else:
-            logger.log(f"Crawl: Fetching Kecamatans for Kabupaten: {k_name} ({k_code})...")
-            kec_data = await fetch_json_with_retry(client, kec_url, semaphore, logger, delay)
-            db_local = SessionLocal()
-            try:
-                for item in kec_data:
-                    kc_code = safe_str(item.get("kode_wilayah"))
-                    kc_name = safe_str(item.get("nama"))
-                    kc_mst = safe_str(item.get("mst_kode_wilayah"))
-                    
-                    db_local.merge(Kecamatan(kode_wilayah=kc_code, nama=kc_name, mst_kode_wilayah=kc_mst))
-                    kec_items.append((kc_code, kc_name))
-                db_local.commit()
-            finally:
-                db_local.close()
-        
-        # Increment totals in database
-        total_sekolahs_added = len(kec_items) * len(bentuk_pendidikan_list)
-        await update_job_db(job_id, {
-            "increment_total_kecamatans": len(kec_items),
-            "increment_total_sekolahs": total_sekolahs_added
-        })
-        
-        # Crawl all districts (kecamatans) sequentially to avoid interleaving queue delays
-        for kc_code, kc_name in kec_items:
-            for bentuk in bentuk_pendidikan_list:
-                if job_id in CANCELLED_JOBS:
-                    return
-                await chain_crawl_kecamatan(
-                    client, kc_code, kc_name, bentuk, semester_id,
-                    semaphore, delay, force_recrawl, job_id, logger
-                )
-        
-    except Exception as e:
-        logger.log(f"Error fetching Kecamatans for {k_name}: {e}")
-        
+
+    if not kecamatans:
+        logger.log("Warning: No Kecamatans found in DB to crawl Sekolahs. Run Stage 3 (Crawling Kecamatan) first!")
+        return
+
+    total_sekolahs_target = len(kecamatans) * len(bentuk_pendidikan_list)
     await update_job_db(job_id, {
-        "increment_processed_kabupatens": 1,
-        "increment_processed_kecamatans": len(kec_data) if 'kec_data' in locals() and kec_data else 0
+        "total_kecamatans": len(kecamatans),
+        "total_sekolahs": total_sekolahs_target
     })
 
+    for kec in kecamatans:
+        if job_id in CANCELLED_JOBS:
+            break
+        await chain_crawl_kecamatan(
+            session, kec.kode_wilayah, kec.nama, bentuk_pendidikan_list, semester_id,
+            semaphore, delay, force_recrawl, job_id, logger
+        )
+        await update_job_db(job_id, {"increment_processed_kecamatans": 1})
 
-async def chain_crawl_province(
-    client: httpx.AsyncClient,
-    prov_code: str,
-    prov_name: str,
-    bentuk_pendidikan_list: list,
-    semester_id: str,
-    semaphore: asyncio.Semaphore,
-    delay: float,
-    force_recrawl: bool,
-    job_id: str,
-    logger: JobLogger
-):
-    if job_id in CANCELLED_JOBS:
-        return
-        
-    db_local = SessionLocal()
-    existing_kabs = []
-    try:
-        if not force_recrawl:
-            existing_kabs = db_local.query(Kabupaten).filter(Kabupaten.mst_kode_wilayah == prov_code).all()
-    finally:
-        db_local.close()
-        
-    kab_items = []
-    kab_url = f"https://dapo.kemendikdasmen.go.id/rekap/dataSekolah?id_level_wilayah=1&kode_wilayah={prov_code}&semester_id={semester_id}"
-    try:
-        if existing_kabs:
-            logger.log(f"Cache Hit (DB): Found {len(existing_kabs)} Kabupatens for Province {prov_name} in DB.")
-            for kab in existing_kabs:
-                kab_items.append((kab.kode_wilayah, kab.nama))
-        else:
-            logger.log(f"Crawl: Fetching Kabupatens for Province: {prov_name} ({prov_code})...")
-            kab_data = await fetch_json_with_retry(client, kab_url, semaphore, logger, delay)
-            db_local = SessionLocal()
-            try:
-                for item in kab_data:
-                    k_code = safe_str(item.get("kode_wilayah"))
-                    k_name = safe_str(item.get("nama"))
-                    k_mst = safe_str(item.get("mst_kode_wilayah"))
-                    
-                    db_local.merge(Kabupaten(kode_wilayah=k_code, nama=k_name, mst_kode_wilayah=k_mst))
-                    kab_items.append((k_code, k_name))
-                db_local.commit()
-            finally:
-                db_local.close()
-        
-        # Increment total kabupatens dynamically
-        await update_job_db(job_id, {"increment_total_kabupatens": len(kab_items)})
-        
-        # Crawl all regencies (kabupatens) sequentially
-        for k_code, k_name in kab_items:
-            if job_id in CANCELLED_JOBS:
-                return
-            await chain_crawl_kabupaten(
-                client, k_code, k_name, bentuk_pendidikan_list, semester_id,
-                semaphore, delay, force_recrawl, job_id, logger
-            )
-        
-    except Exception as e:
-        logger.log(f"Error fetching Kabupatens for Province {prov_name}: {e}")
-        
-    await update_job_db(job_id, {"increment_processed_provinces": 1})
+    logger.log("Stage 4 Complete: Sekolahs scraped & saved in database.")
 
 
 async def crawl_dapodik_task(
     job_id: str,
+    step: str = "all",
     target_provinsi_ids: list = None,
     bentuk_pendidikan_list: list = None,
     semester_id: str = "20252",
@@ -506,11 +627,12 @@ async def crawl_dapodik_task(
     force_recrawl: bool = False
 ):
     logger = JobLogger(job_id)
-    logger.log("Starting Dapodik Chained Request crawler with polite throttling...")
+    logger.log(f"Starting Dapodik crawler job (Step: {step})...")
     
     if not bentuk_pendidikan_list:
         bentuk_pendidikan_list = ["sd", "smp", "sma"]
         
+    logger.log(f"Stage Target: {step}")
     logger.log(f"Forms target: {bentuk_pendidikan_list}")
     logger.log(f"Semester ID: {semester_id}")
     logger.log(f"Concurrency limit: {concurrency_limit} requests")
@@ -525,7 +647,8 @@ async def crawl_dapodik_task(
 
         # Initialize job counters
         job.status = "running"
-        job.current_step = "provinces"
+        job.step = step
+        job.current_step = step
         job.total_provinces = 0
         job.processed_provinces = 0
         job.total_kabupatens = 0
@@ -539,83 +662,55 @@ async def crawl_dapodik_task(
         db.close()
     
     semaphore = asyncio.Semaphore(concurrency_limit)
-    limits = httpx.Limits(max_keepalive_connections=concurrency_limit, max_connections=concurrency_limit * 2)
     
-    async with httpx.AsyncClient(limits=limits) as client:
+    async with AsyncSession(impersonate="chrome") as session:
         try:
             if job_id in CANCELLED_JOBS:
                 raise asyncio.CancelledError()
-                
-            db_local = SessionLocal()
-            existing_provs = []
-            try:
-                if not force_recrawl:
-                    existing_provs = db_local.query(Province).all()
-            finally:
-                db_local.close()
-                
-            provinces_to_process = []
-            if existing_provs:
-                logger.log(f"Cache Hit (DB): Found {len(existing_provs)} Provinces in DB.")
-                for prov in existing_provs:
-                    if target_provinsi_ids and prov.kode_wilayah not in target_provinsi_ids:
-                        continue
-                    provinces_to_process.append((prov.kode_wilayah, prov.nama))
-            else:
-                logger.log("Fetching Provinces from Root...")
-                prov_url = f"https://dapo.kemendikdasmen.go.id/rekap/dataSekolah?id_level_wilayah=0&kode_wilayah=000000&semester_id={semester_id}"
-                
-                prov_data = await fetch_json_with_retry(client, prov_url, semaphore, logger, delay)
-                
-                db_local = SessionLocal()
-                try:
-                    for item in prov_data:
-                        code = safe_str(item.get("kode_wilayah"))
-                        name = safe_str(item.get("nama"))
-                        mst_code = str(item.get("mst_kode_wilayah", "")).strip() if item.get("mst_kode_wilayah") is not None else None
-                        
-                        db_local.merge(Province(kode_wilayah=code, nama=name, mst_kode_wilayah=mst_code))
-                        if target_provinsi_ids and code not in target_provinsi_ids:
-                            continue
-                        provinces_to_process.append((code, name))
-                        
-                    db_local.commit()
-                finally:
-                    db_local.close()
-            
-            await update_job_db(job_id, {
-                "total_provinces": len(provinces_to_process),
-                "current_step": "chaining"
+
+            # Dynamic API Token retrieval
+            logger.log("Fetching API configuration and token...")
+            token = await get_api_token(session, logger)
+            session.headers.update({
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json, text/plain, */*",
+                "Referer": "https://dapo.kemendikdasmen.go.id/"
             })
-            
-            logger.log(f"Found {len(provinces_to_process)} target provinces. Starting parallel chained requests...")
-            
-            # Start chain requests sequentially
-            for code, name in provinces_to_process:
-                if job_id in CANCELLED_JOBS:
-                    break
-                await chain_crawl_province(
-                    client, code, name, bentuk_pendidikan_list, semester_id,
-                    semaphore, delay, force_recrawl, job_id, logger
-                )
+
+            if step == "provinces":
+                await crawl_provinces_step(session, target_provinsi_ids, semester_id, semaphore, delay, force_recrawl, job_id, logger)
+            elif step == "kabupatens":
+                await crawl_kabupatens_step(session, target_provinsi_ids, semester_id, semaphore, delay, force_recrawl, job_id, logger)
+            elif step == "kecamatans":
+                await crawl_kecamatans_step(session, target_provinsi_ids, semester_id, semaphore, delay, force_recrawl, job_id, logger)
+            elif step == "sekolahs":
+                await crawl_sekolahs_step(session, target_provinsi_ids, bentuk_pendidikan_list, semester_id, semaphore, delay, force_recrawl, job_id, logger)
+            else: # "all"
+                await crawl_provinces_step(session, target_provinsi_ids, semester_id, semaphore, delay, force_recrawl, job_id, logger)
+                if job_id not in CANCELLED_JOBS:
+                    await crawl_kabupatens_step(session, target_provinsi_ids, semester_id, semaphore, delay, force_recrawl, job_id, logger)
+                if job_id not in CANCELLED_JOBS:
+                    await crawl_kecamatans_step(session, target_provinsi_ids, semester_id, semaphore, delay, force_recrawl, job_id, logger)
+                if job_id not in CANCELLED_JOBS:
+                    await crawl_sekolahs_step(session, target_provinsi_ids, bentuk_pendidikan_list, semester_id, semaphore, delay, force_recrawl, job_id, logger)
             
             if job_id in CANCELLED_JOBS:
                 raise asyncio.CancelledError()
                 
-            logger.log("Crawl completed successfully!")
+            logger.log("Crawl job completed successfully!")
             await update_job_db(job_id, {
                 "status": "completed",
                 "current_step": "idle"
             })
             
         except asyncio.CancelledError:
-            logger.log("Crawl was cancelled by user.")
+            logger.log("Crawl job was cancelled by user.")
             await update_job_db(job_id, {
                 "status": "cancelled",
                 "current_step": "idle"
             })
         except Exception as e:
-            logger.log(f"Crawl failed: {str(e)}")
+            logger.log(f"Crawl job failed: {str(e)}")
             await update_job_db(job_id, {
                 "status": "failed",
                 "current_step": "idle",
@@ -628,6 +723,7 @@ async def crawl_dapodik_task(
 
 def start_background_crawl(
     job_id: str,
+    step: str = "all",
     target_provinsi_ids: list = None,
     bentuk_pendidikan_list: list = None,
     semester_id: str = "20252",
@@ -639,6 +735,7 @@ def start_background_crawl(
     loop.create_task(
         crawl_dapodik_task(
             job_id,
+            step,
             target_provinsi_ids,
             bentuk_pendidikan_list,
             semester_id,

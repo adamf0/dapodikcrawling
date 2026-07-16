@@ -2,3 +2,4 @@ fastapi>=0.100.0
 uvicorn>=0.22.0
 sqlalchemy>=2.0.0
 httpx>=0.24.0
+curl_cffi>=0.7.0

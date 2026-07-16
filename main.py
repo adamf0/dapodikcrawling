@@ -39,6 +39,7 @@ async def startup_event():
             
             start_background_crawl(
                 job_id=job.id,
+                step=getattr(job, "step", "all") or "all",
                 target_provinsi_ids=prov_ids,
                 bentuk_pendidikan_list=bentuk_list,
                 semester_id=job.semester_id,
@@ -62,6 +63,7 @@ app.add_middleware(
 
 # Request Models
 class CrawlRequest(BaseModel):
+    step: Optional[str] = "all"  # all, provinces, kabupatens, kecamatans, sekolahs
     target_provinsi_ids: Optional[List[str]] = None
     bentuk_pendidikan_list: Optional[List[str]] = None
     semester_id: Optional[str] = "20252"
@@ -87,11 +89,13 @@ async def start_crawl(req: CrawlRequest, db: Session = Depends(get_db)):
         )
 
     job_id = str(uuid.uuid4())
+    step = req.step or "all"
     
     # Create CrawlJob record
     new_job = CrawlJob(
         id=job_id,
         status="pending",
+        step=step,
         current_step="idle",
         target_provinsi_ids=json.dumps(req.target_provinsi_ids) if req.target_provinsi_ids else None,
         bentuk_pendidikan_list=json.dumps(req.bentuk_pendidikan_list) if req.bentuk_pendidikan_list else None,
@@ -106,6 +110,7 @@ async def start_crawl(req: CrawlRequest, db: Session = Depends(get_db)):
     # Trigger background crawler
     start_background_crawl(
         job_id=job_id,
+        step=step,
         target_provinsi_ids=req.target_provinsi_ids,
         bentuk_pendidikan_list=req.bentuk_pendidikan_list,
         semester_id=req.semester_id,
@@ -114,7 +119,24 @@ async def start_crawl(req: CrawlRequest, db: Session = Depends(get_db)):
         force_recrawl=req.force_recrawl
     )
 
-    return {"job_id": job_id, "message": "Crawl job started in background."}
+    return {"job_id": job_id, "step": step, "message": f"Crawl job started for step '{step}' in background."}
+
+
+@app.post("/api/db/truncate")
+async def truncate_database(db: Session = Depends(get_db)):
+    """Deletes all rows from all tables in the database."""
+    try:
+        db.query(models.Sekolah).delete()
+        db.query(models.CrawledKecamatan).delete()
+        db.query(models.Kecamatan).delete()
+        db.query(models.Kabupaten).delete()
+        db.query(models.Province).delete()
+        db.query(models.CrawlJob).delete()
+        db.commit()
+        return {"message": "All tables truncated successfully."}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to truncate database: {str(e)}")
 
 
 @app.post("/api/crawl/cancel/{job_id}")
