@@ -12,6 +12,7 @@ const statProvinces = document.getElementById('stat-provinces');
 const statKabupatens = document.getElementById('stat-kabupatens');
 const statKecamatans = document.getElementById('stat-kecamatans');
 const statSekolahs = document.getElementById('stat-sekolahs');
+const statMadrasahs = document.getElementById('stat-madrasahs');
 
 // const inputTargetProvs = document.getElementById('target-prov-ids');
 const inputCrawlStep = document.getElementById('crawl-step');
@@ -94,6 +95,9 @@ async function fetchStats() {
         statKabupatens.textContent = data.totals.kabupatens.toLocaleString();
         statKecamatans.textContent = data.totals.kecamatans.toLocaleString();
         statSekolahs.textContent = data.totals.sekolahs.toLocaleString();
+        if (statMadrasahs && data.totals.madrasahs !== undefined) {
+            statMadrasahs.textContent = data.totals.madrasahs.toLocaleString();
+        }
     } catch (err) {
         console.error('Failed to fetch stats:', err);
     }

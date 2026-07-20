@@ -15,7 +15,7 @@ from sqlalchemy import func
 
 from database import engine, get_db, SessionLocal
 import models
-from models import Base, Province, Kabupaten, Kecamatan, Sekolah, CrawlJob
+from models import Base, Province, Kabupaten, Kecamatan, Sekolah, CrawlJob, Madrasah
 from crawler import start_background_crawl, cancel_job
 
 # Initialize DB tables
@@ -132,6 +132,7 @@ async def truncate_database(db: Session = Depends(get_db)):
         db.query(models.Kabupaten).delete()
         db.query(models.Province).delete()
         db.query(models.CrawlJob).delete()
+        db.query(models.Madrasah).delete()
         db.commit()
         return {"message": "All tables truncated successfully."}
     except Exception as e:
@@ -240,6 +241,7 @@ async def get_stats(db: Session = Depends(get_db)):
     kab_count = db.query(func.count(Kabupaten.kode_wilayah)).scalar()
     kec_count = db.query(func.count(Kecamatan.kode_wilayah)).scalar()
     school_count = db.query(func.count(Sekolah.sekolah_id)).scalar()
+    madrasah_count = db.query(func.count(Madrasah.nsm)).scalar()
     
     shapes_data = db.query(Sekolah.bentuk_pendidikan, func.count(Sekolah.sekolah_id)).group_by(Sekolah.bentuk_pendidikan).all()
     shapes = {shape: count for shape, count in shapes_data}
@@ -252,11 +254,49 @@ async def get_stats(db: Session = Depends(get_db)):
             "provinces": prov_count,
             "kabupatens": kab_count,
             "kecamatans": kec_count,
-            "sekolahs": school_count
+            "sekolahs": school_count,
+            "madrasahs": madrasah_count
         },
         "shapes": shapes,
         "status": status
     }
+
+
+@app.get("/api/madrasahs")
+async def get_madrasahs(
+    provinsi: Optional[str] = None,
+    kabupaten_kota: Optional[str] = None,
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db)
+):
+    query = db.query(Madrasah)
+    
+    if provinsi:
+        query = query.filter(Madrasah.provinsi.ilike(f"%{provinsi}%"))
+    if kabupaten_kota:
+        query = query.filter(Madrasah.kabupaten_kota.ilike(f"%{kabupaten_kota}%"))
+    if status:
+        query = query.filter(Madrasah.status.ilike(f"%{status}%"))
+    if search:
+        query = query.filter(
+            (Madrasah.nama_madrasah.ilike(f"%{search}%")) | 
+            (Madrasah.nsm.ilike(f"%{search}%")) |
+            (Madrasah.alamat.ilike(f"%{search}%"))
+        )
+        
+    total = query.count()
+    items = query.order_by(Madrasah.nama_madrasah).offset(offset).limit(limit).all()
+    
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "items": items
+    }
+
 
 
 @app.get("/api/provinces")

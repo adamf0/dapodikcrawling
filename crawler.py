@@ -5,7 +5,7 @@ import re
 from curl_cffi.requests import AsyncSession
 from sqlalchemy.orm import Session
 from database import SessionLocal
-from models import Province, Kabupaten, Kecamatan, Sekolah, CrawlJob, CrawledKecamatan
+from models import Province, Kabupaten, Kecamatan, Sekolah, CrawlJob, CrawledKecamatan, Madrasah
 
 # Global set for cancelled jobs
 CANCELLED_JOBS = set()
@@ -616,6 +616,114 @@ async def crawl_sekolahs_step(
     logger.log("Stage 4 Complete: Sekolahs scraped & saved in database.")
 
 
+async def crawl_madrasah_step(
+    session: AsyncSession,
+    sub_kategori: str,
+    semaphore: asyncio.Semaphore,
+    delay: float,
+    job_id: str,
+    logger: JobLogger
+):
+    """Stage 5: Crawl Kemenag Madrasah data"""
+    if job_id in CANCELLED_JOBS:
+        return
+
+    await update_job_db(job_id, {"current_step": "madrasah"})
+    logger.log("=== STAGE 5: Crawling Kemenag Madrasahs ===")
+
+    url = f"https://appmadrasah.kemenag.go.id/diversifikasi/web/gridMadrasah?draw=1&start=0&length=1000000&sub_kategori={sub_kategori or '12'}"
+    logger.log(f"Posting request to Kemenag Madrasah API: {url}...")
+
+    try:
+        r = await session.post(url, timeout=120.0)
+        if r.status_code != 200:
+            raise Exception(f"HTTP Error {r.status_code} from Kemenag API")
+
+        payload = r.json()
+        raw_data = payload.get("data", [])
+        if isinstance(raw_data, dict):
+            raw_data = list(raw_data.values())
+
+        total_records = len(raw_data)
+        logger.log(f"Received {total_records} Madrasah records from Kemenag API. Processing and saving to database...")
+
+        await update_job_db(job_id, {
+            "total_sekolahs": total_records,
+            "processed_sekolahs": 0
+        })
+
+        db_local = SessionLocal()
+        batch = []
+        batch_size = 1000
+        processed_count = 0
+
+        for row in raw_data:
+            if job_id in CANCELLED_JOBS:
+                break
+
+            try:
+                no_val = int(row[0]) if len(row) > 0 and str(row[0]).isdigit() else None
+                jenis = safe_str(row[1]) if len(row) > 1 else ""
+                nsm = safe_str(row[2]) if len(row) > 2 else ""
+                html_cell = safe_str(row[3]) if len(row) > 3 else ""
+                status = safe_str(row[4]) if len(row) > 4 else ""
+                alamat = safe_str(row[5]) if len(row) > 5 else ""
+                kab_kota = safe_str(row[6]) if len(row) > 6 else ""
+                provinsi = safe_str(row[7]) if len(row) > 7 else ""
+
+                nama_madrasah = ""
+                profile_url = ""
+                if html_cell:
+                    m_url = re.search(r'href="([^"]+)"', html_cell)
+                    if m_url:
+                        profile_url = m_url.group(1).replace("\\/", "/")
+                    m_name = re.search(r'>([^<]+)</a>', html_cell)
+                    if m_name:
+                        nama_madrasah = m_name.group(1).strip()
+                    else:
+                        nama_madrasah = re.sub(r'<[^>]+>', '', html_cell).strip()
+
+                if not nsm:
+                    continue
+
+                batch.append(Madrasah(
+                    nsm=nsm,
+                    no=no_val,
+                    jenis=jenis,
+                    nama_madrasah=nama_madrasah or "Tanpa Nama",
+                    profile_url=profile_url,
+                    status=status,
+                    alamat=alamat,
+                    kabupaten_kota=kab_kota,
+                    provinsi=provinsi
+                ))
+                processed_count += 1
+
+                if len(batch) >= batch_size:
+                    for item in batch:
+                        db_local.merge(item)
+                    db_local.commit()
+                    batch = []
+                    await update_job_db(job_id, {"processed_sekolahs": processed_count})
+
+            except Exception as row_err:
+                logger.log(f"Error parsing row: {row_err}")
+                continue
+
+        if batch:
+            for item in batch:
+                db_local.merge(item)
+            db_local.commit()
+            await update_job_db(job_id, {"processed_sekolahs": processed_count})
+
+        db_local.close()
+        logger.log(f"Stage 5 Complete: {processed_count} Madrasahs saved to database!")
+
+    except Exception as e:
+        logger.log(f"Error in Madrasah crawler: {e}")
+        raise e
+
+
 async def crawl_dapodik_task(
     job_id: str,
     step: str = "all",
@@ -668,31 +776,36 @@ async def crawl_dapodik_task(
             if job_id in CANCELLED_JOBS:
                 raise asyncio.CancelledError()
 
-            # Dynamic API Token retrieval
-            logger.log("Fetching API configuration and token...")
-            token = await get_api_token(session, logger)
-            session.headers.update({
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json, text/plain, */*",
-                "Referer": "https://dapo.kemendikdasmen.go.id/"
-            })
+            if step == "madrasah":
+                await crawl_madrasah_step(session, "12", semaphore, delay, job_id, logger)
+            else:
+                # Dynamic API Token retrieval for Dapodik steps
+                logger.log("Fetching API configuration and token...")
+                token = await get_api_token(session, logger)
+                session.headers.update({
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json, text/plain, */*",
+                    "Referer": "https://dapo.kemendikdasmen.go.id/"
+                })
 
-            if step == "provinces":
-                await crawl_provinces_step(session, target_provinsi_ids, semester_id, semaphore, delay, force_recrawl, job_id, logger)
-            elif step == "kabupatens":
-                await crawl_kabupatens_step(session, target_provinsi_ids, semester_id, semaphore, delay, force_recrawl, job_id, logger)
-            elif step == "kecamatans":
-                await crawl_kecamatans_step(session, target_provinsi_ids, semester_id, semaphore, delay, force_recrawl, job_id, logger)
-            elif step == "sekolahs":
-                await crawl_sekolahs_step(session, target_provinsi_ids, bentuk_pendidikan_list, semester_id, semaphore, delay, force_recrawl, job_id, logger)
-            else: # "all"
-                await crawl_provinces_step(session, target_provinsi_ids, semester_id, semaphore, delay, force_recrawl, job_id, logger)
-                if job_id not in CANCELLED_JOBS:
+                if step == "provinces":
+                    await crawl_provinces_step(session, target_provinsi_ids, semester_id, semaphore, delay, force_recrawl, job_id, logger)
+                elif step == "kabupatens":
                     await crawl_kabupatens_step(session, target_provinsi_ids, semester_id, semaphore, delay, force_recrawl, job_id, logger)
-                if job_id not in CANCELLED_JOBS:
+                elif step == "kecamatans":
                     await crawl_kecamatans_step(session, target_provinsi_ids, semester_id, semaphore, delay, force_recrawl, job_id, logger)
-                if job_id not in CANCELLED_JOBS:
+                elif step == "sekolahs":
                     await crawl_sekolahs_step(session, target_provinsi_ids, bentuk_pendidikan_list, semester_id, semaphore, delay, force_recrawl, job_id, logger)
+                else: # "all"
+                    await crawl_provinces_step(session, target_provinsi_ids, semester_id, semaphore, delay, force_recrawl, job_id, logger)
+                    if job_id not in CANCELLED_JOBS:
+                        await crawl_kabupatens_step(session, target_provinsi_ids, semester_id, semaphore, delay, force_recrawl, job_id, logger)
+                    if job_id not in CANCELLED_JOBS:
+                        await crawl_kecamatans_step(session, target_provinsi_ids, semester_id, semaphore, delay, force_recrawl, job_id, logger)
+                    if job_id not in CANCELLED_JOBS:
+                        await crawl_sekolahs_step(session, target_provinsi_ids, bentuk_pendidikan_list, semester_id, semaphore, delay, force_recrawl, job_id, logger)
+                    if job_id not in CANCELLED_JOBS:
+                        await crawl_madrasah_step(session, "12", semaphore, delay, job_id, logger)
             
             if job_id in CANCELLED_JOBS:
                 raise asyncio.CancelledError()

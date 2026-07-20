@@ -113,3 +113,19 @@ class CrawlJob(Base):
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
     error_message = Column(Text, nullable=True)
 
+
+class Madrasah(Base):
+    __tablename__ = "madrasahs"
+    
+    nsm = Column(String(50), primary_key=True, index=True)
+    no = Column(Integer, nullable=True)
+    jenis = Column(String(255), nullable=True)
+    nama_madrasah = Column(String(255), nullable=False, index=True)
+    profile_url = Column(String(500), nullable=True)
+    status = Column(String(50), nullable=True)
+    alamat = Column(Text, nullable=True)
+    kabupaten_kota = Column(String(255), nullable=True, index=True)
+    provinsi = Column(String(255), nullable=True, index=True)
+    crawled_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+

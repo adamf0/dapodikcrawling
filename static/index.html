@@ -36,8 +36,12 @@
                 <div class="stat-value" id="stat-kecamatans">0</div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">Schools Stored (SQLite)</div>
+                <div class="stat-label">Schools Stored (Dapodik)</div>
                 <div class="stat-value" id="stat-sekolahs">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Madrasahs (Kemenag)</div>
+                <div class="stat-value" id="stat-madrasahs">0</div>
             </div>
         </div>
 
@@ -59,11 +63,12 @@
                     <label class="form-label">Tahap Crawling / Crawl Stage</label>
                     <div class="select-wrapper">
                         <select id="crawl-step" class="form-input" style="width: 100%; padding: 0.5rem; border-radius: 6px;">
-                            <option value="all">Full Pipeline (1. Prov -> 2. Kab -> 3. Kec -> 4. Sekolah)</option>
+                            <option value="all">Full Pipeline (1. Prov -> 2. Kab -> 3. Kec -> 4. Sekolah -> 5. Madrasah)</option>
                             <option value="provinces">Stage 1: Crawl Provinsi</option>
                             <option value="kabupatens">Stage 2: Crawl Kabupaten</option>
                             <option value="kecamatans">Stage 3: Crawl Kecamatan</option>
-                            <option value="sekolahs">Stage 4: Crawl Sekolah</option>
+                            <option value="sekolahs">Stage 4: Crawl Sekolah (Dapodik)</option>
+                            <option value="madrasah">Stage 5: Crawl Madrasah (Kemenag)</option>
                         </select>
                     </div>
                 </div>
